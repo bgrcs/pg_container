@@ -1,4 +1,4 @@
-module github.com/bgrcs/pgcontainer
+module github.com/bgrcs/pg_container
 
 go 1.23.4
 
