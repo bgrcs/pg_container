@@ -19,11 +19,15 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
 	cli "github.com/urfave/cli/v3"
 )
 
 //go:embed pg_dump
 var pgDump []byte
+
+//go:embed Dockerfile
+var dockerfile []byte
 
 func main() {
 	cli := &cli.Command{
@@ -66,19 +70,23 @@ func processBackup(connectionURL string, createContainerFlag bool) {
 	tmpDir := os.TempDir()
 	pgDumpPath := filepath.Join(tmpDir, "pg_dump")
 
-	tmpFile, err := os.Create(pgDumpPath)
-	if err != nil {
-		panic(err)
-	}
-	defer tmpFile.Close()
+	if _, err := os.Stat(pgDumpPath); os.IsNotExist(err) {
+		tmpFile, err := os.Create(pgDumpPath)
+		if err != nil {
+			panic(err)
+		}
+		defer tmpFile.Close()
 
-	_, err = tmpFile.Write(pgDump)
-	if err != nil {
-		panic(err)
-	}
+		_, err = tmpFile.Write(pgDump)
+		if err != nil {
+			panic(err)
+		}
 
-	err = tmpFile.Chmod(0755)
-	if err != nil {
+		err = tmpFile.Chmod(0755)
+		if err != nil {
+			panic(err)
+		}
+	} else if err != nil {
 		panic(err)
 	}
 
@@ -101,7 +109,7 @@ func processBackup(connectionURL string, createContainerFlag bool) {
 	}
 	defer apiClient.Close()
 
-	imageName := createDockerImage(databaseName, apiClient, tw, tarBuffer)
+	imageName := createDockerImage(databaseName, apiClient, tw, tarBuffer, databaseName)
 
 	if createContainerFlag {
 		createContainer(apiClient, databaseName, imageName)
@@ -129,13 +137,8 @@ func extractDatabaseName(connectionURL string) (string, error) {
 	return dbName, nil
 }
 
-func createDockerImage(imageName string, apiClient *client.Client, tw *tar.Writer, buffer *bytes.Buffer) string {
+func createDockerImage(imageName string, apiClient *client.Client, tw *tar.Writer, buffer *bytes.Buffer, databaseName string) string {
 	println("> Step 2: 🖼️  Creating Docker image")
-
-	dockerfile := `FROM postgres
-				   ENV POSTGRES_PASSWORD docker
-				   ENV POSTGRES_DB world
-				   COPY dump.sql /docker-entrypoint-initdb.d/`
 
 	err := tw.WriteHeader(&tar.Header{
 		Name: "Dockerfile",
@@ -145,7 +148,7 @@ func createDockerImage(imageName string, apiClient *client.Client, tw *tar.Write
 	if err != nil {
 		log.Fatalf("Failed to write tar header: %s", err)
 	}
-	_, err = tw.Write([]byte(dockerfile))
+	_, err = tw.Write(dockerfile)
 	if err != nil {
 		log.Fatalf("Failed to write Dockerfile to tar: %s", err)
 	}
@@ -160,21 +163,33 @@ func createDockerImage(imageName string, apiClient *client.Client, tw *tar.Write
 	fullImageName := imageName + "-" + formattedTime + ":latest"
 
 	buildOptions := types.ImageBuildOptions{
-		Tags:       []string{fullImageName},
-		Dockerfile: "Dockerfile",
-		Remove:     true,
+		Tags:        []string{fullImageName},
+		Dockerfile:  "Dockerfile",
+		Remove:      true,
+		ForceRemove: true,
+		BuildArgs: map[string]*string{
+			"DB_NAME": &databaseName,
+		},
 	}
 
 	ctx := context.Background()
-
 	buildResponse, err := apiClient.ImageBuild(ctx, buildContext, buildOptions)
-
-	io.Copy(io.Discard, buildResponse.Body)
 
 	if err != nil {
 		panic(err)
 	}
-	defer buildResponse.Body.Close()
+
+	if buildResponse.Body == nil {
+		panic("Unknown error occurred when building docker image")
+	}
+
+	defer func() {
+		if buildResponse.Body != nil {
+			buildResponse.Body.Close()
+		}
+	}()
+
+	io.Copy(io.Discard, buildResponse.Body)
 
 	fmt.Printf("✅ Image built successfully with name: %s\n", fullImageName)
 
@@ -186,31 +201,47 @@ func createContainer(apiClient *client.Client, databaseName string, imageName st
 
 	containerConfig := &container.Config{
 		Image: imageName,
+		Env:   []string{},
+
+		ExposedPorts: nat.PortSet{
+			"5432/tcp": struct{}{},
+		},
 	}
-	hostConfig := &container.HostConfig{}
+	hostConfig := &container.HostConfig{
+		PortBindings: nat.PortMap{
+			"5432/tcp": []nat.PortBinding{
+				{
+					HostIP:   "127.0.0.1",
+					HostPort: "5432",
+				},
+			},
+		},
+	}
 
 	containerName := "postgres-" + databaseName + "-" + strconv.FormatInt(time.Now().Unix(), 10)
 
-	containerCreateResp, err := apiClient.ContainerCreate(context.Background(), containerConfig, hostConfig, nil, nil, containerName)
+	_, err := apiClient.ContainerCreate(context.Background(), containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
 		panic(err)
 	}
 
-	err = apiClient.ContainerStart(context.Background(), containerCreateResp.ID, container.StartOptions{})
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("✅ Container started with name: %s\n", containerName)
+	fmt.Printf("✅ Container created with name: %s\n", containerName)
 }
 
 func runPgDumpToTar(pgDumpPath, connectionURL string, tw *tar.Writer) error {
 	var dumpBuffer bytes.Buffer
+	var stderr bytes.Buffer
 
 	cmd := exec.Command(pgDumpPath, connectionURL)
+	cmd.Stderr = &stderr
 	cmd.Stdout = &dumpBuffer
 
 	if err := cmd.Start(); err != nil {
+		panic(err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		fmt.Println(stderr.String())
 		panic(err)
 	}
 
@@ -221,10 +252,6 @@ func runPgDumpToTar(pgDumpPath, connectionURL string, tw *tar.Writer) error {
 		Mode:     0777,
 		Size:     dumpSize,
 		Typeflag: tar.TypeReg,
-	}
-
-	if err := tw.WriteHeader(tarHeader); err != nil {
-		panic(err)
 	}
 
 	if err := tw.WriteHeader(tarHeader); err != nil {
